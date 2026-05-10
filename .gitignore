@@ -1,0 +1,17 @@
+# secrets
+.env
+
+# FAISS index & metadata (regenerated from CSV at startup)
+*.faiss
+*_meta.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
