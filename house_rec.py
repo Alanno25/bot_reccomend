@@ -5,12 +5,13 @@ RAG Pipeline
   [R] Retrieval  : BGE-M3 embed → FAISS similarity search
                    + Nominatim geocode → Haversine distance search
   [A] Augmented  : inject top-K listings as context into LLM prompt
-  [G] Generation : Groq LLM generates bilingual response
+  [G] Generation : Anthropic Claude generates bilingual response
 
 Data source: merged_data.csv (53 k rows, 64 cols)
 """
 
 import os
+import re
 import json
 import math
 import hashlib
@@ -22,7 +23,9 @@ import numpy as np
 import pandas as pd
 import faiss
 from FlagEmbedding import BGEM3FlagModel
-from groq import Groq
+# from groq import Groq                          # Groq
+# import google.generativeai as genai            # Gemini
+import anthropic                                 # pip install anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,20 +33,27 @@ load_dotenv()
 # ──────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────
-CSV_PATH      = "merged_data.csv"
-INDEX_PATH    = "real_estate.faiss"
-METADATA_PATH = "real_estate_meta.json"
+BASE_DIR      = Path(__file__).parent
+CSV_PATH      = str(BASE_DIR / "merged_data.csv")
+INDEX_PATH    = str(BASE_DIR / "real_estate.faiss")
+METADATA_PATH = str(BASE_DIR / "real_estate_meta.json")
 
 TOP_K                = 10
 SIMILARITY_THRESHOLD = 0.35
-LOCATION_RADIUS_KM   = 5.0
+LOCATION_RADIUS_KM   = 20.0
+LOCATION_RADIUS_WIDE = 35.0   # fallback radius when primary finds 0 results
 MAX_HISTORY_TURNS    = 5
+HAVERSINE_PREFETCH   = 1.6    # multiply radius before road-distance check to catch all candidates
+SEMANTIC_FALLBACK_MAX_KM = 20.0  # max distance for semantic-fallback results when ref_point is known
 
 EMBED_BATCH_SIZE = 16
 EMBED_MAX_LENGTH = 512
 
-LLM_MODEL       = "llama-3.3-70b-versatile"
-LLM_TEMPERATURE = 0.3
+# LLM_MODEL       = "llama-3.3-70b-versatile"   # Groq
+# GEMINI_MODEL    = "gemini-2.0-flash"           # Gemini
+
+CLAUDE_MODEL    = "claude-sonnet-4-6"
+LLM_TEMPERATURE = 0.0
 
 AMENITY_COLS = [
     "Elevator", "Parking", "Security", "CCTV", "Pool",
@@ -86,128 +96,162 @@ def _f(x, default=None):
         return default
 
 
-def _pick_f(row: pd.Series, *cols) -> float | None:
-    """Return first non-null float from a list of column names.
-    Safe alternative to chaining `or` — NaN is truthy in Python so
-    `NaN or next_val` returns NaN instead of falling through."""
-    for col in cols:
-        v = _f(row.get(col))
-        if v is not None:
-            return v
-    return None
-
-
-def _pick_s(row: pd.Series, *cols) -> str:
-    """Return first non-empty string from a list of column names."""
-    for col in cols:
-        v = _s(row.get(col))
-        if v:
-            return v
-    return ""
-
-
-def _pick_i(row: pd.Series, *cols, default: int = 0) -> int:
-    """Return first non-zero int from a list of column names."""
-    for col in cols:
-        v = _i(row.get(col))
-        if v:
-            return v
-    return default
-
-
 # ──────────────────────────────────────────
 # [R] Phase 1 — Load & Build Documents
 # ──────────────────────────────────────────
+def _coalesce_str(df: pd.DataFrame, *cols: str) -> pd.Series:
+    """Return first non-empty string across cols (left-to-right priority)."""
+    result = pd.Series("", index=df.index, dtype=str)
+    for col in reversed(cols):
+        if col not in df.columns:
+            continue
+        v = df[col].fillna("").astype(str).str.strip()
+        v = v.where(~v.str.lower().isin(["", "nan", "none"]), "")
+        result = v.where(v != "", result)
+    return result
+
+
+def _coalesce_num(df: pd.DataFrame, *cols: str) -> pd.Series:
+    """Return first non-null numeric value across cols (left-to-right priority)."""
+    result = pd.Series(np.nan, index=df.index, dtype=float)
+    for col in reversed(cols):
+        if col not in df.columns:
+            continue
+        v = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        result = v.where(v.notna(), result)
+    return result
+
+
 def load_docs_from_csv(path: str) -> list[dict]:
     """
     Read merged_data.csv and convert each row into a doc dict with:
       - structured metadata  (for filtering / display)
       - fused TH+EN text     (for BGE-M3 embedding)
       - lat/lon              (for haversine search)
+
+    Uses vectorized pandas operations for column extraction (fast),
+    then a single loop only for per-row text building and amenity lists.
     """
     df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
-    docs = []
 
-    for i, r in df.iterrows():
-        # ── Core fields ──
-        name      = _pick_s(r, "name_th", "name_x", "name_y")
-        ptype     = _pick_s(r, "propertytype_name_en") or "Condo"
-        province  = _pick_s(r, "province_name_en")
-        # district_x is 0 non-null → skip; district_y (32,745) and district_name_th (20,820)
-        district  = _pick_s(r, "district_name_th", "district_y")
-        nbh       = _pick_s(r, "neighborhood_name_th", "subdistrict_name_th")
-        developer = _pick_s(r, "developer_name_th")
-        url       = _pick_s(r, "url_project")
+    # ── Vectorized column extraction ──
+    name      = _coalesce_str(df, "name_th", "name_x", "name_y")
+    ptype_raw = _coalesce_str(df, "propertytype_name_en")
+    ptype     = ptype_raw.where(ptype_raw != "", "Condo")
+    province  = _coalesce_str(df, "province_name_en")
+    district  = _coalesce_str(df, "district_name_th", "district_y")
+    nbh       = _coalesce_str(df, "neighborhood_name_th", "subdistrict_name_th")
+    developer = _coalesce_str(df, "developer_name_th")
+    url       = _coalesce_str(df, "url_project")
 
-        price_min    = _pick_i(r, "price_min")
-        price_sqm    = _pick_i(r, "price_sqm_x", "price_sqm_y")
-        year_built   = _pick_i(r, "year_built_x", "year_built_y")
-        nbr_floors   = _pick_i(r, "nbr_floors_x", "nbr_floors_y")
-        rental_yield = _f(r.get("rental_yield"))
+    price_min    = _coalesce_num(df, "price_min").fillna(0).astype(int)
+    price_sqm    = _coalesce_num(df, "price_sqm_x", "price_sqm_y").fillna(0).astype(int)
+    year_built   = _coalesce_num(df, "year_built_x", "year_built_y").fillna(0).astype(int)
+    nbr_floors   = _coalesce_num(df, "nbr_floors_x", "nbr_floors_y").fillna(0).astype(int)
+    rental_yield = _coalesce_num(df, "rental_yield")
 
-        # ── Coordinates ──
-        # Use only real source coordinates — never lat_round (join key, not a property coordinate)
-        # latitude_prop: 20,825 rows (from prop.csv)
-        # latitude     : 32,745 rows (from df_cleaned/scraped)
-        # Together they cover all 53,466 rows with no gaps
-        lat = _pick_f(r, "latitude_prop", "latitude")
-        lon = _pick_f(r, "longitude_prop", "longitude")
+    # ── Coordinates ──
+    # latitude_prop / longitude_prop  (prop.csv)   : 20,825 rows, 18,123 unique pairs
+    #   → building-level coordinates, accurate for haversine distance search
+    # latitude / longitude            (df_cleaned) : 32,745 rows, only 1,018 unique pairs
+    #   → district/neighbourhood CENTROIDS — 96.9% duplicates
+    #   → must NOT be used for distance search (up to 2 km off from actual building)
+    #
+    # Rule: coord_accurate=True only when latitude_prop is available.
+    lat_prop = _coalesce_num(df, "latitude_prop")
+    lon_prop = _coalesce_num(df, "longitude_prop")
+    lat_cent = _coalesce_num(df, "latitude")
+    lon_cent = _coalesce_num(df, "longitude")
 
-        # ── Transit ──
-        transit_raw = _s(r.get("transportation", "")).lower()
-        if "bts" in transit_raw:
-            transit = "BTS"
-        elif "mrt" in transit_raw:
-            transit = "MRT"
-        else:
-            transit = ""
+    has_prop     = lat_prop.notna() & lon_prop.notna()
+    lat          = lat_prop.where(has_prop, lat_cent)
+    lon          = lon_prop.where(has_prop, lon_cent)
+    coord_acc    = has_prop
 
-        # ── Amenities ──
-        amenities  = [c for c in AMENITY_COLS if _i(r.get(c)) == 1]
+    # ── Transit (BTS takes priority over MRT) ──
+    trans_raw = df.get("transportation", pd.Series("", index=df.index))
+    trans_raw = trans_raw.fillna("").astype(str).str.lower()
+    transit   = pd.Series("", index=df.index, dtype=str)
+    transit   = transit.where(~trans_raw.str.contains("mrt", na=False), "MRT")
+    transit   = transit.where(~trans_raw.str.contains("bts", na=False), "BTS")
+
+    # ── Amenities matrix (vectorized) ──
+    amenity_cols_present = [c for c in AMENITY_COLS if c in df.columns]
+    amenity_matrix = (
+        df[amenity_cols_present]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
+        .astype(int)
+        == 1
+    )
+
+    # ── Per-row loop: only for amenity lists + text building ──
+    docs: list[dict] = []
+    for i in df.index:
+        amenities  = [c for c in amenity_cols_present if amenity_matrix.at[i, c]]
         amenity_th = " ".join(amenities) if amenities else "ไม่ระบุ"
         amenity_en = ", ".join(amenities) if amenities else "none listed"
 
-        # ── Fused TH + EN text for embedding ──
+        nm = name.at[i]
+        pt = ptype.at[i]
+        pr = province.at[i]
+        di = district.at[i]
+        nb = nbh.at[i]
+        dv = developer.at[i]
+        pm = int(price_min.at[i])
+        ps = int(price_sqm.at[i])
+        yb = int(year_built.at[i])
+        nf = int(nbr_floors.at[i])
+        ry = rental_yield.at[i] if pd.notna(rental_yield.at[i]) else None
+        tr = transit.at[i]
+        la = lat.at[i] if pd.notna(lat.at[i]) else None
+        lo = lon.at[i] if pd.notna(lon.at[i]) else None
+        ca = bool(coord_acc.at[i])
+
         th = (
-            f"โครงการ {name} ประเภท {ptype} "
-            f"ย่าน {nbh} เขต {district} จังหวัด {province} "
-            f"ราคาเริ่มต้น {price_min:,} บาท ราคาเฉลี่ย {price_sqm:,} บาท/ตร.ม. "
-            f"สร้างปี {year_built} จำนวน {nbr_floors} ชั้น "
+            f"โครงการ {nm} ประเภท {pt} "
+            f"ย่าน {nb} เขต {di} จังหวัด {pr} "
+            f"ราคาเริ่มต้น {pm:,} บาท ราคาเฉลี่ย {ps:,} บาท/ตร.ม. "
+            f"สร้างปี {yb} จำนวน {nf} ชั้น "
             f"สิ่งอำนวยความสะดวก: {amenity_th}"
-            + (f" ใกล้รถไฟฟ้า {transit}" if transit else "")
-            + (f" ผลตอบแทนเช่า {rental_yield}%" if rental_yield else "")
-            + (f" โดย {developer}" if developer else "")
+            + (f" ใกล้รถไฟฟ้า {tr}" if tr else "")
+            + (f" ผลตอบแทนเช่า {ry}%" if ry else "")
+            + (f" โดย {dv}" if dv else "")
         )
         en = (
-            f"{ptype} project {name} "
-            f"in {nbh}, {district}, {province}, "
-            f"from {price_min:,} THB, avg {price_sqm:,} THB/sqm, "
-            f"built {year_built}, {nbr_floors} floors, "
+            f"{pt} project {nm} "
+            f"in {nb}, {di}, {pr}, "
+            f"from {pm:,} THB, avg {ps:,} THB/sqm, "
+            f"built {yb}, {nf} floors, "
             f"amenities: {amenity_en}"
-            + (f" near {transit}" if transit else "")
-            + (f" rental yield {rental_yield}%" if rental_yield else "")
-            + (f" by {developer}" if developer else "")
+            + (f" near {tr}" if tr else "")
+            + (f" rental yield {ry}%" if ry else "")
+            + (f" by {dv}" if dv else "")
         )
 
         docs.append({
-            "id":           f"MD-{i}",
-            "name":         name,
-            "type":         ptype,
-            "province":     province,
-            "district":     district,
-            "neighborhood": nbh,
-            "developer":    developer,
-            "price_thb":    price_min or price_sqm,
-            "price_per_sqm": price_sqm,
-            "year_built":   year_built,
-            "nbr_floors":   nbr_floors,
-            "rental_yield": rental_yield,
-            "near_transit": transit or None,
-            "amenities":    amenities,
-            "url":          url,
-            "latitude":     lat,
-            "longitude":    lon,
-            "text":         f"TH: {th} | EN: {en}",
+            "id":            f"MD-{i}",
+            "name":          nm,
+            "type":          pt,
+            "province":      pr,
+            "district":      di,
+            "neighborhood":  nb,
+            "developer":     dv,
+            "price_thb":     pm or ps,
+            "price_per_sqm": ps,
+            "year_built":    yb,
+            "nbr_floors":    nf,
+            "rental_yield":  ry,
+            "near_transit":  tr or None,
+            "amenities":     amenities,
+            "url":           url.at[i],
+            "latitude":      la,
+            "longitude":     lo,
+            "coord_accurate": ca,
+            "text":          f"TH: {th} | EN: {en}",
         })
 
     print(f"Loaded {len(docs):,} docs from {path}")
@@ -275,7 +319,6 @@ def retrieve_semantic(
         for s, i in zip(scores[0], indices[0])
         if i != -1 and float(s) >= SIMILARITY_THRESHOLD
     ]
-    # Sort by price ascending
     results.sort(key=lambda x: x[0].get("price_thb") or float("inf"))
     return results
 
@@ -284,13 +327,27 @@ def retrieve_semantic(
 # [R] Phase 3b — Location-based Retrieval
 # ──────────────────────────────────────────
 
-# Bounding box for Thailand — used to reject obviously wrong coordinates
 _TH_LAT_MIN, _TH_LAT_MAX = 5.5, 20.5
 _TH_LON_MIN, _TH_LON_MAX = 97.5, 105.7
 
-# OSM geometry type scoring: node = exact point (most accurate),
-# way = polygon centroid (moderate), relation = large area centroid (least accurate)
 _OSM_TYPE_SCORE = {"node": 2.0, "way": 1.0, "relation": 0.0}
+
+# In-memory geocode cache — avoids repeated Nominatim calls for the same place name
+_geocode_cache: dict[str, tuple | None] = {}
+
+# Regex for queries that are CLEARLY follow-ups / non-location — skip LLM call entirely.
+# Everything else goes to LLM for place extraction (safer: fewer false negatives).
+_NO_PLACE_RE = re.compile(
+    r"^(?:"
+    r"ขอบคุณ|โอเค|โอเค|ได้เลย|ok|okay|thanks|thank you|"
+    r"บอกอีก(?:ที)?|แสดงอีก|ดูอีก|show more|"
+    r"อธิบาย(?:เพิ่มเติม)?|explain|tell me more|"
+    r"ราคาเท่าไหร่|ราคา[อะไร]|price\??|how much\??|"
+    r"มีอะไรอีก|anything else|"
+    r"ใช่|ไม่ใช่|yes|no|nope|yep"
+    r")[\s?!.]*$",
+    re.IGNORECASE,
+)
 
 
 def _in_thailand(lat: float, lon: float) -> bool:
@@ -300,21 +357,18 @@ def _in_thailand(lat: float, lon: float) -> bool:
 def geocode_place(text: str) -> tuple[float, float, str, str] | None:
     """
     Multi-strategy Nominatim geocoding with OSM geometry-type preference.
+    Results are cached in _geocode_cache for the lifetime of the process.
 
     Why OSM type matters:
       node     = single GPS point  → coordinates are exact
       way      = building polygon  → coordinates are centroid (may be off 50-300 m)
       relation = large area        → centroid can be off 500 m – 2 km
 
-    Strategy:
-      1. Try plain query (e.g. "เซ็นทรัลเวิลด์")
-      2. Retry prefixed with กรุงเทพมหานคร if no candidates yet
-         (skip for provinces like Chiang Mai / Phuket)
-      3. Score all candidates: importance + OSM type bonus
-      4. Return best-scoring result inside Thailand's bounding box.
-
     Returns (lat, lon, display_name, osm_type) or None.
     """
+    if text in _geocode_cache:
+        return _geocode_cache[text]
+
     lower = text.lower()
     queries = [text]
     if not any(x in lower for x in ["เชียงใหม่", "ภูเก็ต", "phuket", "chiang mai", "chiangmai"]):
@@ -344,45 +398,94 @@ def geocode_place(text: str) -> tuple[float, float, str, str] | None:
                 lon = float(hit["lon"])
                 if not _in_thailand(lat, lon):
                     continue
-                osm_type  = hit.get("osm_type", "")
+                osm_type   = hit.get("osm_type", "")
                 importance = float(hit.get("importance", 0))
-                score = importance + _OSM_TYPE_SCORE.get(osm_type, 0.0)
+                score      = importance + _OSM_TYPE_SCORE.get(osm_type, 0.0)
                 all_candidates.append((score, lat, lon, hit.get("display_name", ""), osm_type))
         except Exception:
             pass
         if all_candidates:
-            break   # good enough — don't try the next query variant
+            break
 
     if not all_candidates:
+        _geocode_cache[text] = None
         return None
 
     all_candidates.sort(key=lambda x: -x[0])
     _, lat, lon, display, osm_type = all_candidates[0]
-    return lat, lon, display, osm_type
+    result = (lat, lon, display, osm_type)
+    _geocode_cache[text] = result
+    return result
 
 
-def extract_place_name(query: str, llm: Groq) -> str:
+def road_distance_batch(
+    origin_lat: float,
+    origin_lon: float,
+    destinations: list[tuple[float, float]],
+) -> list[float | None]:
     """
-    Use a fast LLM call to pull out just the place / location entity from
-    the user's free-text query.  Returns the bare place name, or empty string
-    if no specific place is mentioned.
+    Google Maps Distance Matrix API — road distances from one origin to many destinations.
+    Returns list[km | None]. Batches 25 destinations per request (API limit).
+    Falls back to None for each element on error or missing key.
     """
-    resp = llm.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": (
-                "Extract ONLY the place name, landmark, BTS/MRT station, "
-                "shopping mall, hospital, district, or area from the user message. "
-                "Return ONLY the place name in its original language (Thai or English) "
-                "— no explanation, no punctuation, no extra words. "
-                "If no specific place is mentioned, return empty string."
-            )},
-            {"role": "user", "content": query},
-        ],
-        temperature=0,
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not api_key or api_key == "your_key_here":
+        return [None] * len(destinations)
+
+    results: list[float | None] = []
+    for i in range(0, len(destinations), 25):
+        batch = destinations[i : i + 25]
+        dest_str = "|".join(f"{lat},{lon}" for lat, lon in batch)
+        params = urllib.parse.urlencode({
+            "origins":      f"{origin_lat},{origin_lon}",
+            "destinations": dest_str,
+            "mode":         "driving",
+            "key":          api_key,
+        })
+        req = urllib.request.Request(
+            f"https://maps.googleapis.com/maps/api/distancematrix/json?{params}",
+            headers={"User-Agent": "BangkokBlessAsset-Chatbot/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            elements = data.get("rows", [{}])[0].get("elements", [])
+            for elem in elements:
+                if elem.get("status") == "OK":
+                    results.append(elem["distance"]["value"] / 1000.0)
+                else:
+                    results.append(None)
+        except Exception:
+            results.extend([None] * len(batch))
+
+    return results
+
+
+def extract_place_name(query: str, llm: anthropic.Anthropic) -> str:
+    """
+    Extract the place/location entity from the user's query.
+
+    Fast path: if the query contains no location-like keywords, return ""
+    immediately without calling the LLM (saves API cost + ~300 ms latency).
+    Only queries that match _HAS_PLACE_RE get sent to Claude for extraction.
+    """
+    if _NO_PLACE_RE.match(query.strip()):
+        return ""
+
+    resp = llm.messages.create(
+        model=CLAUDE_MODEL,
         max_tokens=40,
+        temperature=0,
+        system=(
+            "Extract ONLY the place name, landmark, BTS/MRT station, "
+            "shopping mall, hospital, district, or area from the user message. "
+            "Return ONLY the place name in its original language (Thai or English) "
+            "— no explanation, no punctuation, no extra words. "
+            "If no specific place is mentioned, return empty string."
+        ),
+        messages=[{"role": "user", "content": query}],
     )
-    return resp.choices[0].message.content.strip()
+    return resp.content[0].text.strip()
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -401,23 +504,24 @@ def retrieve_by_location(
     place_name: str,
     docs: list[dict],
     radius_km: float = LOCATION_RADIUS_KM,
-) -> tuple[list[tuple[dict, float]], str | None]:
+) -> tuple[list[tuple[dict, float]], str | None, str, tuple[float, float] | None]:
     """
-    Geocode place_name → find all docs within radius_km →
-    return (results, context_note).
+    Geocode place_name → road distance (Google Maps) or haversine fallback →
+    return listings within radius_km sorted by price + context note + dist_label + ref_point.
 
-    context_note is passed to the LLM so it can tell the user:
-      - which place was geocoded
-      - how accurate the reference point is (node vs polygon centroid)
+    Returns: (nearby, context_note, dist_label, ref_point)
+      dist_label — "ถนน" when Google Maps is used, "เส้นตรง" otherwise.
+      ref_point  — (lat, lon) of the geocoded place, or None if geocoding failed.
+                   Returned even when nearby is empty so caller can compute
+                   distances for semantic-fallback results.
     """
     if not place_name:
-        return [], None
+        return [], None, "เส้นตรง", None
     result = geocode_place(place_name)
     if not result:
-        return [], None
+        return [], None, "เส้นตรง", None
     lat, lon, display_name, osm_type = result
 
-    # Accuracy note based on OSM geometry type
     accuracy_note = {
         "node":     "precise point",
         "way":      "building centroid (±100–300 m)",
@@ -430,27 +534,57 @@ def retrieve_by_location(
         f"\n      display: {display_name[:100]}"
     )
 
-    nearby = []
+    # Step 1: haversine pre-filter at HAVERSINE_PREFETCH × radius to get candidates
+    prefetch_r = radius_km * HAVERSINE_PREFETCH
+    candidates: list[tuple[dict, float]] = []
     for doc in docs:
-        dlat = doc.get("latitude")
-        dlon = doc.get("longitude")
+        if not doc.get("coord_accurate"):
+            continue
+        dlat, dlon = doc.get("latitude"), doc.get("longitude")
         if dlat is None or dlon is None:
             continue
         if not _in_thailand(dlat, dlon):
             continue
-        dist = haversine(lat, lon, dlat, dlon)
+        if haversine(lat, lon, dlat, dlon) <= prefetch_r:
+            candidates.append((doc, dlat, dlon))  # type: ignore[arg-type]
+
+    # Step 2: road distance via Google Maps (batch), fallback to haversine per element
+    api_key   = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    use_road  = bool(api_key and api_key != "your_key_here")
+    dist_label = "ถนน" if use_road else "เส้นตรง"
+
+    if use_road and candidates:
+        dests      = [(dlat, dlon) for _, dlat, dlon in candidates]
+        road_dists = road_distance_batch(lat, lon, dests)
+    else:
+        road_dists = [None] * len(candidates)
+
+    nearby: list[tuple[dict, float]] = []
+    fallback_count = 0
+    for (doc, dlat, dlon), road_d in zip(candidates, road_dists):
+        if road_d is not None:
+            dist = road_d
+        else:
+            dist = haversine(lat, lon, dlat, dlon)
+            fallback_count += 1
         if dist <= radius_km:
             nearby.append((doc, dist))
 
+    method_str = (
+        f"road (Google Maps Driving){f', {fallback_count} haversine fallbacks' if fallback_count else ''}"
+        if use_road else "straight-line (haversine)"
+    )
+    print(f"[DIST] method={method_str}  radius={radius_km} km  candidates={len(candidates)}  matched={len(nearby)}")
     nearby.sort(key=lambda x: (x[0].get("price_thb") or float("inf"), x[1]))
 
-    # Context note tells LLM what was geocoded and how precise it is
     context_note = (
         f"Geocoded '{place_name}' as: {display_name[:120]}"
         f" | geometry={osm_type} ({accuracy_note})"
         f" | ref_point=({lat:.6f}, {lon:.6f})"
+        f" | radius={radius_km} km"
+        f" | distance_method={method_str}"
     )
-    return nearby, context_note
+    return nearby, context_note, dist_label, (lat, lon)
 
 
 # ──────────────────────────────────────────
@@ -462,40 +596,78 @@ You are a bilingual (Thai/English) real estate assistant for Bangkok Bless Asset
 Rules:
 1. Detect the user's language — reply in the same language.
 2. Use ONLY the provided listing context. Never fabricate data.
-3. Present listings sorted cheapest → most expensive (top 5–10).
+3. Present listings sorted cheapest → most expensive (top 10).
 4. LOCATION SEARCH: When the user mentions any place name (Thai or English),
    the system automatically geocodes it to obtain the latitude/longitude of that
-   place, then finds all listings whose coordinates fall within a 5 km radius.
+   place, then finds all listings whose coordinates fall within a 20 km radius
+   (or 35 km if no results found at 20 km).
    The RAG context will be labeled "[RAG context — location]" in that case.
-   • Always acknowledge the place name and confirm search was done by proximity.
-   • Show each listing's distance (km) from that place.
-   • If geocoding fails or no listings are nearby, say so and fall back to keyword search.
+   • At the TOP of your reply state the reference point explicitly, e.g.:
+     "📍 จุดอ้างอิง: BTS อโศก (lat=13.737593, lon=100.560699)"
+   • If the context says radius=20 km, mention it to the user.
+   • Distances are shown as "X.XX km (ถนน)" when Google Maps road distance is used,
+     or "X.XX km (เส้นตรง)" when straight-line haversine is used.
+     Always use the label exactly as it appears in the listing data.
+   • Show FULL details only for listings within the primary radius (0–20 km).
+   • If the context contains HINT_EXTRA, mention to the user that more listings exist
+     beyond 20 km (e.g. "มีอีก X โครงการในรัศมี 35 กม. ถ้าอยากดูบอกได้เลย")
+     but do NOT show their names or any details — wait for user to ask.
+   • If no coord_accurate listings found, system uses semantic search with distance computed
+     from the ref point. Show distances normally.
 5. SEMANTIC SEARCH: When no place name is detected, results come from BGE-M3
    vector similarity. Context label will be "[RAG context — semantic]".
-6. For every listing include: name, type, location (neighborhood/district/province),
-   price (฿ with commas), transit access, and available amenities.
+6. For every listing you MUST show ALL of the following on separate lines:
+   - Name & type
+   - Location (neighborhood / district / province)
+   - Price (฿ with commas)
+   - Transit access (if any)
+   - Amenities (if any)
+   - Coordinates: 📍 lat=XX.XXXXXX, lon=XXX.XXXXXX  ← MANDATORY, never omit
+   - Distance from searched place (location mode only)
 7. If nothing matches, politely say so and suggest refining the search
    (e.g. wider radius, different property type, or different area).
-8. Keep answers concise and friendly. Use bullet points for multiple listings.
+8. If the user says the reference point is wrong (e.g. "wrong place", "not that location",
+   "reference point is incorrect"), immediately ask:
+   "Could you give me the full name of the place? e.g. 'CentralWorld Shopping Mall' or 'Asok BTS Station, Sukhumvit Road'"
+   Wait for the full place name before searching again.
+9. Keep answers friendly. Use bullet points for multiple listings.
 
 คุณคือผู้ช่วยอสังหาฯ ของ Bangkok Bless Asset พูดได้ทั้งไทย-อังกฤษ
 1. ตอบด้วยภาษาเดียวกับลูกค้า
 2. ใช้ข้อมูล listing ที่ให้มาเท่านั้น ห้ามสร้างข้อมูลเอง
-3. เรียงจากราคาถูกไปแพง 5–10 อันดับแรก
+3. เรียงจากราคาถูกไปแพง 10 อันดับแรก
 4. การค้นหาด้วยสถานที่: หากผู้ใช้ระบุชื่อสถานที่ (ภาษาไทยหรืออังกฤษ)
    ระบบจะแปลงชื่อนั้นเป็นละติจูด/ลองจิจูดโดยอัตโนมัติผ่าน Nominatim
-   แล้วค้นหาบ้านที่มีพิกัดอยู่ภายในรัศมี 5 กม. จากสถานที่นั้น
-   • บอกชื่อสถานที่ที่ค้นหา และยืนยันว่าผลลัพธ์มาจากการค้นหาตามระยะทาง
-   • แสดงระยะห่าง (กม.) ของแต่ละรายการจากสถานที่นั้นด้วย
-   • หากหาพิกัดสถานที่ไม่ได้ หรือไม่มี listing อยู่ในรัศมี ให้แจ้งและใช้การค้นหาแบบ semantic แทน
+   แล้วค้นหาบ้านที่มีพิกัดอยู่ภายในรัศมี 20 กม. จากสถานที่นั้น
+   (ถ้าไม่พบในรัศมี 20 กม. จะขยายเป็น 35 กม. โดยอัตโนมัติ)
+   • ขึ้นต้นคำตอบด้วยจุดอ้างอิงเสมอ เช่น:
+     "📍 จุดอ้างอิง: BTS อโศก (lat=13.737593, lon=100.560699)"
+   • ถ้า context ระบุ radius=20 km ให้แจ้งผู้ใช้ด้วย
+   • ระยะทางแสดงเป็น "X.XX km (ถนน)" เมื่อใช้ Google Maps หรือ "X.XX km (เส้นตรง)" เมื่อใช้ haversine
+     ให้ใช้ label ตามที่ปรากฏในข้อมูล listing ทุกครั้ง
+   • แสดงรายละเอียดเต็มเฉพาะ listing ในรัศมี 0–20 กม. เท่านั้น
+   • ถ้า context มี HINT_EXTRA ให้แจ้ง user ว่ามีโครงการเพิ่มเติมในรัศมีที่กว้างกว่า
+     เช่น "มีอีก X โครงการในรัศมี 35 กม. ถ้าอยากดูบอกได้เลย"
+     แต่ห้ามแสดงชื่อหรือรายละเอียดของโครงการเหล่านั้น รอ user ถามก่อน
+   • หากไม่มีพิกัดอาคารในรัศมี ระบบใช้ semantic search พร้อมคำนวณระยะทางจากจุดอ้างอิง แสดงตามปกติ
 5. การค้นหาแบบ semantic: หากไม่มีชื่อสถานที่ ระบบจะใช้ BGE-M3 เวกเตอร์
-6. ระบุ ชื่อ ประเภท ทำเล (ย่าน/เขต/จังหวัด) ราคา รถไฟฟ้า สิ่งอำนวยความสะดวก
+6. ทุก listing ต้องแสดงครบทุกข้อต่อไปนี้:
+   - ชื่อโครงการ และประเภท
+   - ทำเล (ย่าน/เขต/จังหวัด)
+   - ราคา (฿ มีจุลภาค)
+   - รถไฟฟ้า (ถ้ามี)
+   - สิ่งอำนวยความสะดวก (ถ้ามี)
+   - พิกัด: 📍 lat=XX.XXXXXX, lon=XXX.XXXXXX  ← บังคับแสดงทุกครั้ง ห้ามละเว้น
+   - ระยะห่างจากสถานที่ที่ค้นหา (เฉพาะ location mode)
 7. หากไม่พบรายการ ให้แจ้งสุภาพและแนะนำให้ปรับเกณฑ์ (ขยายรัศมี/เปลี่ยนทำเล/ประเภท)
+8. หากผู้ใช้บอกว่าจุดอ้างอิงผิด (เช่น "สถานที่ผิด", "ไม่ใช่ที่นั่น", "จุดอ้างอิงไม่ตรง")
+   ให้ถามกลับทันทีว่า: "ช่วยบอกชื่อเต็มของสถานที่ที่ต้องการได้มั้ย เช่น 'ห้างสรรพสินค้าเซ็นทรัล ลาดพร้าว' หรือ 'สถานี BTS อโศก'"
+   แล้วรอรับชื่อเต็มจากผู้ใช้ก่อนค้นหาใหม่
 """
 
 
-def _format_listing(rank: int, doc: dict, value: float, mode: str) -> str:
-    tag   = f"{value:.2f} km" if mode == "location" else f"score={value:.3f}"
+def _format_listing(rank: int, doc: dict, value: float, mode: str, dist_label: str = "เส้นตรง") -> str:
+    tag   = f"{value:.2f} km ({dist_label})" if mode == "location" else f"score={value:.3f}"
     price = f"฿{doc['price_thb']:,}" if doc.get("price_thb") else "-"
     sqm   = f"฿{doc['price_per_sqm']:,}/sqm" if doc.get("price_per_sqm") else ""
     loc   = ", ".join(x for x in [doc.get("neighborhood"), doc.get("district"), doc.get("province")] if x)
@@ -511,17 +683,23 @@ def _format_listing(rank: int, doc: dict, value: float, mode: str) -> str:
         f"yield={doc['rental_yield']}%" if doc.get("rental_yield") else "",
         f"by {doc['developer']}" if doc.get("developer") else "",
         f"url={doc['url']}" if doc.get("url") else "",
+        (f"coords=({doc['latitude']:.6f}, {doc['longitude']:.6f})"
+         if doc.get("latitude") is not None and doc.get("longitude") is not None else ""),
     ]
     return " | ".join(p for p in parts if p)
 
 
-def build_rag_context(results: list[tuple], mode: str, geocoded_place: str | None = None) -> str:
+def build_rag_context(
+    results: list[tuple],
+    mode: str,
+    geocoded_place: str | None = None,
+    dist_label: str = "เส้นตรง",
+) -> str:
     if not results:
         return "No matching listings found. / ไม่พบรายการที่ตรงกับเงื่อนไข"
     if mode == "location":
-        sort_note = "sorted by distance then price ฿ low→high"
+        sort_note = "sorted by price ฿ low→high then distance"
         header = geocoded_place or ""
-        # Surface accuracy warning to LLM if geometry is imprecise
         if geocoded_place and "centroid" in geocoded_place:
             header += (
                 "\nNOTE: reference point is a polygon centroid — distances shown are"
@@ -531,7 +709,7 @@ def build_rag_context(results: list[tuple], mode: str, geocoded_place: str | Non
     else:
         sort_note = "sorted by price ฿ low→high"
         header = ""
-    rows = "\n".join(_format_listing(i, d, v, mode) for i, (d, v) in enumerate(results, 1))
+    rows  = "\n".join(_format_listing(i, d, v, mode, dist_label) for i, (d, v) in enumerate(results, 1))
     parts = [p for p in [header, f"[{sort_note}]", rows] if p]
     return "\n".join(parts)
 
@@ -542,62 +720,133 @@ def build_rag_context(results: list[tuple], mode: str, geocoded_place: str | Non
 def rag_chat(
     user_query: str,
     history: list[dict],
-    model: BGEM3FlagModel,
+    embed_model: BGEM3FlagModel,
     idx: faiss.Index,
     docs: list[dict],
-    llm: Groq,
+    llm: anthropic.Anthropic,
 ) -> tuple[str, list[tuple], str]:
-    # [R] Retrieve
-    # Step 1: extract just the place name so Nominatim gets an accurate query
+    # [R] Retrieve — primary radius (full details)
     place_name = extract_place_name(user_query, llm)
-    location_results, geocoded_place = retrieve_by_location(place_name, docs)
+    location_results, geocoded_place, dist_label, ref_point = retrieve_by_location(place_name, docs)
+
+    # Count extras in wider radius (show count only — no details)
+    extra_count = 0
+    if place_name and location_results:
+        wide_all, _, _, _ = retrieve_by_location(place_name, docs, radius_km=LOCATION_RADIUS_WIDE)
+        extra_count = max(0, len(wide_all) - len(location_results))
+        if extra_count > 0 and geocoded_place:
+            geocoded_place += (
+                f" | HINT_EXTRA: นอกจากนี้ยังมีอีก {extra_count} โครงการในรัศมี {LOCATION_RADIUS_WIDE} กม."
+                f" — แจ้ง user ว่า 'มีอีก {extra_count} โครงการในรัศมี {LOCATION_RADIUS_WIDE} กม."
+                f" ถ้าอยากดูรายละเอียดบอกได้เลย' แต่ห้ามแสดงรายชื่อหรือข้อมูลเพิ่มเติม รอ user ถาม"
+            )
+
     if location_results:
         results = location_results[:TOP_K]
         mode    = "location"
     else:
-        results = retrieve_semantic(user_query, model, idx, docs)
-        mode    = "semantic"
-        geocoded_place = None
+        # Semantic fallback with distance computation when ref_point is known
+        semantic_results = retrieve_semantic(user_query, embed_model, idx, docs)
+
+        api_key  = os.getenv("GOOGLE_MAPS_API_KEY", "")
+        use_road = bool(api_key and api_key != "your_key_here")
+
+        if ref_point and semantic_results:
+            ref_lat, ref_lon = ref_point
+            dist_label  = "ถนน" if use_road else "เส้นตรง"
+            with_coords = [(doc, s) for doc, s in semantic_results
+                           if doc.get("latitude") and doc.get("longitude")]
+
+            if use_road and with_coords:
+                dests     = [(doc["latitude"], doc["longitude"]) for doc, _ in with_coords]
+                road_dsts = road_distance_batch(ref_lat, ref_lon, dests)
+                results   = []
+                for (doc, _), rd in zip(with_coords, road_dsts):
+                    dist = rd if rd is not None else haversine(ref_lat, ref_lon, doc["latitude"], doc["longitude"])
+                    if dist <= SEMANTIC_FALLBACK_MAX_KM:
+                        results.append((doc, dist))
+            else:
+                results = [
+                    (doc, haversine(ref_lat, ref_lon, doc["latitude"], doc["longitude"]))
+                    for doc, _ in with_coords
+                    if haversine(ref_lat, ref_lon, doc["latitude"], doc["longitude"]) <= SEMANTIC_FALLBACK_MAX_KM
+                ]
+
+            results = results[:TOP_K]
+            mode    = "location"
+            if not geocoded_place:
+                geocoded_place = (
+                    f"ref_point=({ref_lat:.6f}, {ref_lon:.6f})"
+                    f" | distance_method={'road (Google Maps Driving)' if use_road else 'straight-line (haversine)'}"
+                )
+        else:
+            results        = semantic_results
+            mode           = "semantic"
+            geocoded_place = None
+            dist_label     = "เส้นตรง"
 
     # [A] Augment
-    context  = build_rag_context(results, mode, geocoded_place)
-    trimmed  = history[-(MAX_HISTORY_TURNS * 2):]
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": f"[RAG context — {mode}]\n{context}"},
-        *trimmed,
-        {"role": "user", "content": user_query},
+    context = build_rag_context(results, mode, geocoded_place, dist_label)
+    claude_history = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in history[-(MAX_HISTORY_TURNS * 2):]
     ]
 
     # [G] Generate
-    resp = llm.chat.completions.create(
-        model=LLM_MODEL, messages=messages, temperature=LLM_TEMPERATURE,
+    resp = llm.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        temperature=LLM_TEMPERATURE,
+        system=SYSTEM_PROMPT + f"\n\n[RAG context — {mode}]\n{context}",
+        messages=[*claude_history, {"role": "user", "content": user_query}],
     )
-    return resp.choices[0].message.content, results, mode
+    return resp.content[0].text, results, mode
 
 
 # ──────────────────────────────────────────
-# Main
+# Pipeline initialiser (for FastAPI / web use)
+# ──────────────────────────────────────────
+def init_pipeline() -> dict:
+    """
+    Load all heavy resources once at startup and return a pipeline dict.
+    Call this from FastAPI lifespan or any web server boot routine.
+    """
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise EnvironmentError("Set ANTHROPIC_API_KEY in .env  (console.anthropic.com)")
+    if not Path(CSV_PATH).exists():
+        raise FileNotFoundError(f"{CSV_PATH} not found — expected at {CSV_PATH}")
+
+    print("Loading BGE-M3... (first run downloads ~2.3 GB)")
+    embed_model  = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+    faiss_index, docs = load_or_build_index(embed_model)
+    llm_client   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    return {
+        "embed_model": embed_model,
+        "idx":         faiss_index,
+        "docs":        docs,
+        "llm":         llm_client,
+    }
+
+
+# ──────────────────────────────────────────
+# Main (CLI)
 # ──────────────────────────────────────────
 def main():
-    if not os.getenv("GROQ_API_KEY"):
-        raise EnvironmentError("Set GROQ_API_KEY in .env  (free key at console.groq.com)")
-    if not Path(CSV_PATH).exists():
-        raise FileNotFoundError(f"{CSV_PATH} not found in project root")
+    pipeline = init_pipeline()
+    embed_model  = pipeline["embed_model"]
+    faiss_index  = pipeline["idx"]
+    metadata     = pipeline["docs"]
+    llm_client   = pipeline["llm"]
 
-    print("Loading BGE-M3... (first run downloads ~2.3 GB to E drive)")
-    embed_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
-
-    faiss_index, metadata = load_or_build_index(embed_model)
-    llm_client = Groq()
     history: list[dict] = []
 
-    geo_ok = geocode_place("Bangkok") is not None  # connectivity check
+    geo_ok = geocode_place("Bangkok") is not None
     print(f"\n{'=' * 60}")
     print(f"Bangkok Bless Asset RAG Chatbot — {len(metadata):,} listings")
     print(f"  Semantic search : BGE-M3 + FAISS  |  threshold={SIMILARITY_THRESHOLD}")
-    print(f"  Location search : Nominatim  |  radius={LOCATION_RADIUS_KM} km  |  {'online' if geo_ok else 'OFFLINE'}")
-    print(f"  LLM             : {LLM_MODEL}")
+    print(f"  Location search : Nominatim  |  radius={LOCATION_RADIUS_KM}/{LOCATION_RADIUS_WIDE} km  |  {'online' if geo_ok else 'OFFLINE'}")
+    print(f"  LLM             : {CLAUDE_MODEL}")
     print("Type in Thai or English  |  'exit' to quit")
     print(f"{'=' * 60}")
 
@@ -627,7 +876,7 @@ def main():
 
         print(f"\nBot: {answer}")
         if sources:
-            print(f"\n[{mode.upper()} — top {len(sources)} results, sorted by price]")
+            print(f"\n[{mode.upper()} — top {len(sources)} results]")
             for doc, val in sources:
                 label = f"{val:.2f} km" if mode == "location" else f"score={val:.3f}"
                 price = f"฿{doc['price_thb']:,}" if doc.get("price_thb") else "N/A"
